@@ -88,16 +88,40 @@ curl -s -X POST -H "Authorization: Bearer $TOK" -H "X-CE-Requester: $ME" \
      http://127.0.0.1:8943/api/up
 ```
 
+## `huey:8940` — the name proxy
+
+Tailscale gives each device an address, so a client types the device's own port number. Doing
+that here needs root: `127.0.0.1` is the only loopback address macOS routes by default, and
+`/etc/hosts` and `/etc/resolver` both need sudo. So the daemon runs a proxy on
+**127.0.0.1:8944** that resolves device names itself, and any proxy-aware client gets real
+device addresses with no privileges at all:
+
+```bash
+http_proxy=http://127.0.0.1:8944 curl http://huey:8940/api/state
+http_proxy=http://127.0.0.1:8944 curl http://huey.ce:8938/api/bus      # a resolver-style suffix
+ssh -o ProxyCommand='nc -X connect -x 127.0.0.1:8944 %h %p' arduino@huey
+```
+
+It speaks absolute-URI requests and `CONNECT`, so TLS and ssh go through it too, and it opens
+the forward on demand. An unknown name is a 502 that lists the devices it does know.
+`REACH_PROXY_PORT=0` turns it off.
+
 ## Devices
 
 It owns no device record. It reads, in order:
 
-1. `~/dev/ce-devices/access.json` — the table `ce-dev` already uses (wallet alias, node id,
+1. **Signed name bindings** — `ce-iam name ls`, the mesh's own answer to which node a name is,
+   resolved through this machine's accepted roots. `ce-iam name bind huey <node id>` adds one.
+   A device known only from a binding declares no ports, not even ssh: the binding says which
+   node the name is, never what that node serves.
+2. `~/dev/ce-devices/access.json` — the table `ce-dev` already uses (wallet alias, node id,
    ssh user and key path, LAN address, named ports). No secrets: the capability lives in the ce
    wallet and the ssh key in `~/.ssh`.
-2. `~/.config/device-reach/devices.json` — this machine's own additions, same shape, optional.
+3. `~/.config/device-reach/devices.json` — this machine's own additions, same shape, optional.
 
-Later wins per device, but a field the winner does not state keeps the earlier value rather than
+A binding that DISAGREES with a table keeps the table's node id and leaves a note on every
+answer. A disagreement is a fact to look at, not a tie to break quietly. Otherwise a later
+source wins per device, and a field it does not state keeps the earlier value rather than
 becoming null. A table that cannot be read becomes a **note** on every answer, never a silently
 short list.
 
@@ -117,8 +141,10 @@ different ports would open two forwards to one place.
   listener stays bound. The route (a tunnels registry in `ApiState`, `GET /tunnels`,
   `DELETE /tunnel`) is written and tested on branch `tunnel-close` of the `ce` repo and ships
   with the next node build.
-- **No per-device IP and no DNS.** You reach `127.0.0.1:18940`, not `huey:8940`. `ce-iam name`
-  holds the naming half already and has no bindings yet.
+- **No transparent per-device address.** `huey:8940` works through the name proxy, which any
+  proxy-aware client can use, but a client that ignores `http_proxy` still needs the loopback
+  port. Closing that needs a loopback alias per device (`ifconfig lo0 alias`), which needs
+  root, and asking for root to read a leg angle is the wrong trade.
 - **TCP only.** `/ce/tunnel/1` splices TCP. No UDP, no subnet routes, no exit node.
 - **No relayed path measured.** Both devices tested are on one Wi-Fi, so both directions were
   direct libp2p. The relay fallback is unproven here.
