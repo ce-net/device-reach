@@ -9,6 +9,7 @@
   reach get <device> <name> <path>   read-only GET through the forward
   reach down <device> [port]    close those forwards and free the ports (`--all` for every one)
   reach path [--json]           every mesh peer: RTT, direct or relayed, and which device
+  reach policy [--json]         what each device's grant SHOULD be, against what is held
   reach doctor                  node, tables, wallet, every forward, with reasons
   reach serve [port]            run the daemon + web page (default 8943)
 
@@ -258,6 +259,43 @@ def cmd_path(args):
     return PASS
 
 
+def cmd_policy(args):
+    """Hold every held capability against what the policy says it should be. Measures only."""
+    if "--example" in args:
+        with open(os.path.join(os.path.dirname(os.path.dirname(
+                os.path.realpath(__file__))), "policy.example.json")) as f:
+            sys.stdout.write(f.read())
+        return PASS
+    rows, detail = reach.policy_report()
+    if "--json" in args:
+        print(json.dumps({"rows": rows, "detail": detail}, indent=2))
+        return PASS if rows and not detail else UNKNOWN
+    if detail:
+        print("CANNOT DETERMINE: %s" % detail)
+        return UNKNOWN
+    bad = unknown = 0
+    for r in rows:
+        who = r["device"] or "(outside the policy)"
+        print("%-16s %-20s %s" % (r["verdict"], who,
+                                  (r.get("held") or "") if r["device"] else ""))
+        for f in r["findings"]:
+            print("         - %s" % f)
+        if r.get("fix"):
+            print("         fix, run ON %s: %s" % (who, r["fix"]))
+            if r.get("nonce") is not None:
+                print("         then retire the old one: ce-iam revoke --nonce %s" % r["nonce"])
+        if r["verdict"] == reach.FAIL_V:
+            bad += 1
+        elif r["verdict"] == reach.UNKNOWN_V:
+            unknown += 1
+    print()
+    print("%d line(s): %d match the policy, %d do not, %d cannot be judged."
+          % (len(rows), len(rows) - bad - unknown, bad, unknown))
+    if bad:
+        return FAIL
+    return UNKNOWN if unknown else PASS
+
+
 def cmd_doctor(args):
     bad = unknown = 0
     up, detail = reach.node_up()
@@ -307,7 +345,7 @@ def cmd_serve(args):
 
 
 CMDS = {"ls": cmd_ls, "up": cmd_up, "status": cmd_status, "port": cmd_port,
-        "ping": cmd_ping, "get": cmd_get, "down": cmd_down, "path": cmd_path,
+        "ping": cmd_ping, "get": cmd_get, "down": cmd_down, "path": cmd_path, "policy": cmd_policy,
         "doctor": cmd_doctor,
         "serve": cmd_serve}
 

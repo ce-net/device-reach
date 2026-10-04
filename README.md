@@ -51,6 +51,7 @@ here.
 | `reach get <device> <port> <path>` | a read-only GET through the forward |
 | `reach down <device> [port]` / `--all` | close those forwards and free the ports; on a node without the close route it says so |
 | `reach path [--json]` | every mesh peer: measured RTT, how many samples, and whether the path is direct or relayed |
+| `reach policy [--json]` / `--example` | every held capability against what the policy says it should be |
 | `reach doctor` | node, tables, wallet, every forward, with reasons |
 | `reach serve [port]` | the daemon and its machines page (default 8943) |
 
@@ -128,6 +129,51 @@ On a node that does not report `addr` and `relayed` the path column reads `unkno
 command exits **2 CANNOT DETERMINE**, naming the branch that adds the fields. It does not read a
 missing field as "direct" — that would publish "no relays on this mesh" off a node that was
 never asked.
+
+## What a grant should be — `reach policy`
+
+A capability that is wider than the job never fails. It works, which is the problem. The grant
+this Mac held for Huey when the policy was first written allowed `exec, sync, delete, tunnel,
+deploy, kill, status` on every port, forever, for a job that needs `tunnel` on two ports.
+
+So the policy is a file, and the file is checked:
+
+```json
+{
+  "version": 1,
+  "defaults": { "max_days": 90, "warn_days": 14 },
+  "devices": {
+    "huey": { "hold": { "abilities": ["tunnel"], "ports": [8938, 8940] } }
+  }
+}
+```
+
+It lives at `~/dev/ce-devices/policy.json`, beside the device table, with
+`~/.config/device-reach/policy.json` overriding it on one machine. `reach policy --example`
+prints a starting point. Then:
+
+```
+$ reach policy
+FAIL             huey                 home-control, huey
+         - huey: abilities beyond the policy: delete, deploy, exec, kill, status, sync
+         - huey: no port restriction: it tunnels to ANY port, the policy asks for 8938, 8940
+         - huey: never expires; the policy asks for at most 90 days
+         fix, run ON huey: ce-iam grant --to <this node> --resource <huey> --action tunnel \
+                           --allowed-port 8938 --allowed-port 8940 --expires-in 7776000 --nonce …
+```
+
+It measures and it never mints. The command that would fix a line is printed for a person to
+run on the device that issues it, because a grant is that device's decision. Exit 0 when every
+line matches, 1 when one does not, 2 when the wallet or the policy cannot be read.
+
+Three things it refuses to be relaxed about:
+
+- **A device may hold several grants**, and each one is judged. One grant covering the job does
+  not excuse a second that is far wider; the output names both by alias.
+- **An absent port restriction means every port**, not no port. A `tunnel` grant with no
+  `allowed_ports` reaches all 65 535, and that reads as a finding.
+- **A grant outside the policy is listed, not judged.** Other apps' capabilities are not this
+  app's business, but they are not invisible either.
 
 ## Devices
 

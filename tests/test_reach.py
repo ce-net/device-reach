@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import threading
 import unittest
 import urllib.error
@@ -439,6 +440,154 @@ class GateRefuses(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
             reachd.Handler.gate, reachd.Handler.gate_error = old_gate, old_err
+
+
+class FakeWallet:
+    """A stand-in `ce-iam wallet`, so the policy check can be run against grants we choose."""
+
+    def __init__(self, grants):
+        self.grants = grants      # {alias: scope dict}
+
+    def __enter__(self):
+        self.dir = tempfile.TemporaryDirectory()
+        for alias, g in self.grants.items():
+            with open(os.path.join(self.dir.name, alias + ".json"), "w") as f:
+                json.dump(g, f)
+        p = os.path.join(self.dir.name, "ce-iam")
+        listing = "".join("echo '%s'\n" % a for a in self.grants)
+        with open(p, "w") as f:
+            f.write("#!/bin/sh\n"
+                    'if [ "$2" = "list" ]; then\n' + listing + "exit 0\nfi\n"
+                    'if [ "$2" = "show" ]; then cat "' + self.dir.name + '/$3.json"; exit 0; fi\n'
+                    "exit 1\n")
+        os.chmod(p, 0o755)
+        self.old = reach.CE_IAM
+        reach.CE_IAM = p
+        return self
+
+    def __exit__(self, *a):
+        reach.CE_IAM = self.old
+        self.dir.cleanup()
+
+
+class TempPolicy:
+    def __init__(self, doc):
+        self.doc = doc
+
+    def __enter__(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "policy.json")
+        with open(self.path, "w") as f:
+            json.dump(self.doc, f)
+        self.old = (reach.LOCAL_POLICY, reach.CE_DEV_POLICY)
+        reach.LOCAL_POLICY = self.path
+        reach.CE_DEV_POLICY = os.path.join(self.dir.name, "absent.json")
+        return self
+
+    def __exit__(self, *a):
+        reach.LOCAL_POLICY, reach.CE_DEV_POLICY = self.old
+        self.dir.cleanup()
+
+
+def grant(alias, node, abilities, ports=None, not_after=0, nonce=7):
+    link = {"abilities": abilities, "issuer": node, "nonce": nonce,
+            "not_after": not_after, "resource": node}
+    if ports is not None:
+        link["allowed_ports"] = ports
+    return {"alias": alias, "node_id": node,
+            "scope": {"abilities": abilities, "resource": node, "not_after": not_after,
+                      "root_issuer": node, "links": [link]}}
+
+
+class Policy(unittest.TestCase):
+    """A capability nobody looks at is the one that stays too wide. These check that the
+    looking is real: a wider grant must fail, and a missing field must not read as a limit."""
+
+    NODE = "75" * 32
+    TABLE = {"devices": {"huey": {"what": "the duck", "wallet": "huey", "node_id": NODE,
+                                  "ports": {"servo": 8938, "walk": 8940}}}}
+    POL = {"version": 1, "defaults": {"max_days": 90, "warn_days": 14},
+           "devices": {"huey": {"hold": {"abilities": ["tunnel"], "ports": [8938, 8940]}}}}
+
+    def report(self, grants, policy=None, table=None):
+        with TempTable(table or self.TABLE, names=False), \
+                TempPolicy(policy or self.POL), FakeWallet(grants):
+            return reach.policy_report()
+
+    def test_a_grant_that_matches_the_policy_passes(self):
+        soon = int(time.time()) + 60 * 86400
+        rows, detail = self.report({"huey": grant("huey", self.NODE, ["tunnel"],
+                                                  ports=[8938, 8940], not_after=soon)})
+        self.assertEqual(detail, "")
+        self.assertEqual(rows[0]["verdict"], reach.PASS_V, rows[0]["findings"])
+        self.assertIsNone(rows[0]["fix"], "nothing to fix means no command to run")
+
+    def test_a_grant_with_more_abilities_than_the_job_fails(self):
+        soon = int(time.time()) + 60 * 86400
+        rows, _ = self.report({"huey": grant("huey", self.NODE,
+                                             ["tunnel", "exec", "delete"],
+                                             ports=[8938, 8940], not_after=soon)})
+        self.assertEqual(rows[0]["verdict"], reach.FAIL_V)
+        joined = " ".join(rows[0]["findings"])
+        self.assertIn("delete", joined)
+        self.assertIn("exec", joined)
+
+    def test_no_port_restriction_is_every_port_not_no_port(self):
+        """The field is absent on a grant that restricts nothing. Reading absent as 'fine'
+        is how a tunnel grant for two ports quietly becomes one for all 65535."""
+        soon = int(time.time()) + 60 * 86400
+        rows, _ = self.report({"huey": grant("huey", self.NODE, ["tunnel"], not_after=soon)})
+        self.assertEqual(rows[0]["verdict"], reach.FAIL_V)
+        self.assertIn("ANY port", " ".join(rows[0]["findings"]))
+
+    def test_a_grant_that_never_expires_fails_and_the_fix_sets_an_expiry(self):
+        rows, _ = self.report({"huey": grant("huey", self.NODE, ["tunnel"],
+                                             ports=[8938, 8940], not_after=0)})
+        self.assertEqual(rows[0]["verdict"], reach.FAIL_V)
+        self.assertIn("never expires", " ".join(rows[0]["findings"]))
+        self.assertIn("--expires-in 7776000", rows[0]["fix"])
+        self.assertIn("--allowed-port 8938", rows[0]["fix"])
+
+    def test_a_grant_about_to_expire_is_named_with_the_days_left(self):
+        rows, _ = self.report({"huey": grant("huey", self.NODE, ["tunnel"], ports=[8938, 8940],
+                                             not_after=int(time.time()) + 3 * 86400)})
+        self.assertEqual(rows[0]["verdict"], reach.FAIL_V)
+        self.assertIn("expires in 3", " ".join(rows[0]["findings"]))
+
+    def test_several_grants_on_one_device_are_each_judged(self):
+        """One grant covers the job and another is far too wide. Passing on the first and
+        never looking at the second is the failure this guards."""
+        soon = int(time.time()) + 60 * 86400
+        rows, _ = self.report({
+            "huey": grant("huey", self.NODE, ["tunnel"], ports=[8938, 8940], not_after=soon),
+            "home-control": grant("home-control", self.NODE, ["home:door"], not_after=soon),
+        })
+        self.assertEqual(rows[0]["verdict"], reach.FAIL_V)
+        self.assertIn("home-control", " ".join(rows[0]["findings"]))
+
+    def test_a_device_with_no_grant_is_a_fail_with_the_command_that_fixes_it(self):
+        rows, _ = self.report({})
+        self.assertEqual(rows[0]["verdict"], reach.FAIL_V)
+        self.assertIn("no grant held", rows[0]["findings"][0])
+        self.assertIn("--action tunnel", rows[0]["fix"])
+
+    def test_grants_outside_the_policy_are_listed_not_judged(self):
+        soon = int(time.time()) + 60 * 86400
+        rows, _ = self.report({
+            "huey": grant("huey", self.NODE, ["tunnel"], ports=[8938, 8940], not_after=soon),
+            "media": grant("media", "ab" * 32, ["media:get"], not_after=soon),
+        })
+        last = rows[-1]
+        self.assertIsNone(last["device"])
+        self.assertEqual(last["verdict"], reach.UNKNOWN_V)
+        self.assertIn("media", " ".join(last["findings"]))
+
+    def test_no_policy_file_is_cannot_determine_with_the_path(self):
+        with TempPolicy({"devices": {}}) as tp:
+            os.remove(tp.path)
+            rows, detail = reach.policy_report()
+        self.assertEqual(rows, [])
+        self.assertIn("no grant policy", detail)
 
 
 class Paths(unittest.TestCase):

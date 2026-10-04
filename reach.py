@@ -371,6 +371,185 @@ def net_paths():
     return rows, supported, "" if supported else PATH_UNSUPPORTED
 
 
+# ----- the grant policy: what this machine should hold, against what it holds -----
+
+CE_DEV_POLICY = os.path.expanduser("~/dev/ce-devices/policy.json")
+LOCAL_POLICY = os.path.expanduser("~/.config/device-reach/policy.json")
+
+# A capability is only as good as its narrowest field. These are the three that can be wider
+# than intended without anything ever failing, which is why they are checked rather than
+# trusted: abilities beyond the job, no port restriction, and no expiry.
+POLICY_MISSING = (
+    "no grant policy on this machine. A policy says what each device's capability SHOULD be, "
+    "so a grant that is wider than the job can be seen instead of merely working. Write one at "
+    "%s (or %s); `reach policy --example` prints a starting point." % (CE_DEV_POLICY, LOCAL_POLICY)
+)
+
+
+def load_policy():
+    """(policy, source, detail). The first policy file that exists, or None with the reason."""
+    for path in (LOCAL_POLICY, CE_DEV_POLICY):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+        except (OSError, ValueError) as e:
+            return None, path, "cannot read %s: %s" % (path, e)
+        if not isinstance(doc.get("devices"), dict):
+            return None, path, "%s has no `devices` object" % path
+        return doc, path, ""
+    return None, None, POLICY_MISSING
+
+
+def wallet_grants():
+    """(grants, detail). Every held grant, decoded. Keyed by alias; the token is never read."""
+    out = {}
+    try:
+        listing = subprocess.run([CE_IAM, "wallet", "list"], capture_output=True, text=True,
+                                 timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return {}, "cannot run %s wallet list: %s" % (CE_IAM, e)
+    if listing.returncode != 0:
+        return {}, (listing.stderr or listing.stdout).strip()[:300]
+    for line in listing.stdout.splitlines():
+        alias = line.split()[0] if line.split() else ""
+        if not alias:
+            continue
+        try:
+            one = subprocess.run([CE_IAM, "wallet", "show", alias, "--json"],
+                                 capture_output=True, text=True, timeout=20)
+            doc = json.loads(one.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            continue
+        scope = doc.get("scope") or {}
+        links = scope.get("links") or [{}]
+        out[alias] = {
+            "alias": alias,
+            "node_id": doc.get("node_id") or "",
+            "abilities": sorted(scope.get("abilities") or []),
+            "resource": scope.get("resource") or "",
+            "not_after": scope.get("not_after") or 0,
+            # `allowed_ports` is absent on a grant that restricts nothing, and absent is the
+            # whole point: it means every port, not no port.
+            "ports": sorted(links[0].get("allowed_ports") or []) or None,
+            "nonce": links[0].get("nonce"),
+            "issuer": links[0].get("issuer") or scope.get("root_issuer") or "",
+        }
+    return out, ""
+
+
+def _grant_command(dev_node, self_node, want, nonce):
+    ab = " ".join("--action %s" % a for a in want.get("abilities") or [])
+    ports = " ".join("--allowed-port %d" % p for p in want.get("ports") or [])
+    days = int(want.get("max_days") or 90)
+    return ("ce-iam grant --to %s --resource %s %s %s --expires-in %d --nonce %s"
+            % (self_node, dev_node, ab, ports, days * 86400, nonce)).replace("  ", " ")
+
+
+def _grant_findings(g, want, warn_days, now):
+    """Every way this one grant is wider, narrower or staler than the policy wants."""
+    short, wide = [], []
+    need, have = set(want.get("abilities") or []), set(g["abilities"])
+    if need - have:
+        short.append("missing ability: %s" % ", ".join(sorted(need - have)))
+    if have - need:
+        wide.append("abilities beyond the policy: %s" % ", ".join(sorted(have - need)))
+    ports = want.get("ports")
+    if ports and g["ports"] is None:
+        wide.append("no port restriction: it tunnels to ANY port, the policy asks for %s"
+                    % ", ".join(str(p) for p in ports))
+    elif ports and set(g["ports"]) - set(ports):
+        wide.append("ports beyond the policy: %s"
+                    % ", ".join(str(p) for p in sorted(set(g["ports"]) - set(ports))))
+    if not g["not_after"]:
+        wide.append("never expires; the policy asks for at most %s days" % want.get("max_days", 90))
+    else:
+        days = (g["not_after"] - now) / 86400.0
+        if days < 0:
+            short.append("expired %.1f days ago" % -days)
+        elif days < warn_days:
+            wide.append("expires in %.1f days" % days)
+    return short, wide
+
+
+def policy_report():
+    """(rows, detail). One row per policy line, plus one for everything outside the policy.
+
+    A row's `verdict` is PASS, FAIL or CANNOT DETERMINE, and `findings` says what is wrong in
+    words. Nothing here mints, revokes or widens anything: the command that would fix a row is
+    printed for a person to run on the device that issues it.
+
+    A device may hold SEVERAL grants. The line is satisfied when one of them covers the job,
+    and every grant for that device that is wider than the policy is still a finding of its
+    own, named by its alias. A capability nobody looks at is the one that stays too wide.
+    """
+    policy, source, detail = load_policy()
+    if policy is None:
+        return [], detail
+    grants, gdetail = wallet_grants()
+    if gdetail:
+        return [], gdetail
+    devs, _ = load_devices()
+    status_code, doc, _ = _node_json("/status")
+    self_node = (doc or {}).get("node_id", "") if status_code == 200 else ""
+    defaults = policy.get("defaults") or {}
+    warn_days = int(defaults.get("warn_days") or 14)
+    now = int(time.time())
+    rows, declared = [], set()
+
+    for name, spec in sorted((policy.get("devices") or {}).items()):
+        want = dict(defaults, **(spec.get("hold") or spec))
+        dev = devs.get(name) or {}
+        node = dev.get("node_id") or want.get("node_id") or ""
+        if not node:
+            rows.append({"device": name, "verdict": UNKNOWN_V, "held": None, "nonce": None,
+                         "findings": ["no node id for %r in any device table or in the policy"
+                                      % name], "fix": None})
+            continue
+        mine = [g for g in grants.values() if g["node_id"] == node]
+        declared.update(g["alias"] for g in mine)
+        if not mine:
+            rows.append({"device": name, "verdict": FAIL_V, "held": None, "nonce": None,
+                         "findings": ["no grant held for this device"],
+                         "fix": _grant_command(node, self_node, want, now)})
+            continue
+        findings, covered, nonce = [], False, None
+        for g in sorted(mine, key=lambda g: g["alias"]):
+            short, wide = _grant_findings(g, want, warn_days, now)
+            if not short:
+                covered = True
+                nonce = g["nonce"] if nonce is None else nonce
+            findings += ["%s: %s" % (g["alias"], f) for f in short + wide]
+        if covered:
+            findings = [f for f in findings if "missing ability" not in f]
+        else:
+            findings.insert(0, "no held grant covers the job (%s)"
+                            % ", ".join(want.get("abilities") or ["nothing declared"]))
+        rows.append({
+            "device": name, "held": ", ".join(sorted(g["alias"] for g in mine)), "nonce": nonce,
+            "verdict": PASS_V if not findings else FAIL_V,
+            "findings": findings,
+            "fix": _grant_command(node, self_node, want, now) if findings else None,
+        })
+
+    outside = sorted(a for a in grants if a not in declared)
+    if outside:
+        shown = outside[:5]
+        rows.append({
+            "device": None, "held": ", ".join(shown), "nonce": None, "verdict": UNKNOWN_V,
+            "findings": ["%d held grant(s) no policy line asks for: %s%s. Outside this app's "
+                         "scope, not judged here, and listed so they are not invisible."
+                         % (len(outside), ", ".join(shown),
+                            "" if len(outside) == len(shown) else ", and %d more"
+                            % (len(outside) - len(shown)))],
+            "fix": None})
+    return rows, ""
+
+
+PASS_V, FAIL_V, UNKNOWN_V = "PASS", "FAIL", "CANNOT DETERMINE"
+
+
 def http_probe(url, timeout=5.0):
     """(status, seconds, detail). status is an int, or None when it did not answer."""
     t = time.perf_counter()

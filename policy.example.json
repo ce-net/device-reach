@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "_what": "What each device's capability SHOULD be. Checked against the wallet by `reach policy`; nothing here mints or changes a grant.",
+  "defaults": {
+    "max_days": 90,
+    "warn_days": 14
+  },
+  "devices": {
+    "huey": {
+      "_what": "the duck: read the servo bus and drive the walk daemon, nothing else",
+      "hold": {
+        "abilities": ["tunnel"],
+        "ports": [8938, 8940],
+        "max_days": 90
+      }
+    }
+  }
+}
