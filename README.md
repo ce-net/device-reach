@@ -117,10 +117,19 @@ different ports would open two forwards to one place.
 - **No per-device IP and no DNS.** You reach `127.0.0.1:18940`, not `huey:8940`. `ce-iam name`
   holds the naming half already and has no bindings yet.
 - **TCP only.** `/ce/tunnel/1` splices TCP. No UDP, no subnet routes, no exit node.
-- **One machine measured.** Mac to Huey on one Wi-Fi. The relay path is not measured yet.
+- **No relayed path measured.** Both devices tested are on one Wi-Fi, so both directions were
+  direct libp2p. The relay fallback is unproven here.
 
 The full comparison with Tailscale and headscale, in both directions, is in
 [docs/DESIGN.md](docs/DESIGN.md).
+
+## It runs on the small device too
+
+`reach` is stdlib Python, so it runs on the board as well as on the Mac. With a `tunnel` grant
+for the Mac in the board's ce wallet, Huey's UNO Q (Python 3.13.5, aarch64 Linux) reached the
+Mac's loopback-only daemon by name: `reach ping mac reachd --path /api/health -n 30` gave
+p50 37.5 ms, p90 105.3 ms, 30 of 30. The overlay is symmetric and the far end needs nothing
+but a ce node.
 
 ## Tests
 
