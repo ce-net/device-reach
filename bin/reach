@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+"""reach — a device's ports, by name, over ce-net. No host, IP or key typed.
+
+  reach ls                      devices this machine can reach, and their ports
+  reach up [device]             open every declared forward (all devices, or one)
+  reach status [--probe]        what is forwarded now; --probe also GETs each one
+  reach port <device> <name>    one port; prints http://127.0.0.1:<local>
+  reach ping <device> [name]    p50/p90 over the forward (default 20 GETs)
+  reach get <device> <name> <path>   read-only GET through the forward
+  reach down [device]           say what closing would take (see README, it cannot yet)
+  reach doctor                  node, tables, wallet, every forward, with reasons
+  reach serve [port]            run the daemon + web page (default 8943)
+
+Exit codes: 0 PASS, 1 FAIL, 2 CANNOT DETERMINE.
+"""
+
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+import reach  # noqa: E402
+
+PASS, FAIL, UNKNOWN = 0, 1, 2
+
+
+def _device(name):
+    devs, notes = reach.load_devices()
+    if name not in devs:
+        known = ", ".join(sorted(devs)) or "(none)"
+        for n in notes:
+            print("note: %s: %s" % (n.source, n.text), file=sys.stderr)
+        sys.exit("reach: no device %r (known: %s)" % (name, known))
+    return devs[name]
+
+
+def cmd_ls(args):
+    st = reach.status()
+    if "--json" in args:
+        print(json.dumps(st, indent=2))
+        return PASS
+    if not st["devices"]:
+        print("no devices in any table")
+        for n in st["notes"]:
+            print("  note: %s: %s" % (n["source"], n["note"]))
+        return UNKNOWN
+    for d in st["devices"]:
+        print("%-10s %-16s %s" % (d["name"], (d["node_id"] or "")[:16], d["what"] or ""))
+        for p in d["ports"]:
+            mark = "up  " if p["state"] == "up" else "down"
+            print("    %-8s %-4s :%-6s -> %s" % (p["port"], mark, p["remote"],
+                                                 p["url"] or "127.0.0.1:%d" % p["local"]))
+    for n in st["notes"]:
+        print("note: %s: %s" % (n["source"], n["note"]))
+    return PASS
+
+
+def cmd_up(args):
+    devs, notes = reach.load_devices()
+    if args:
+        devs = {args[0]: _device(args[0])}
+    if not devs:
+        print("no devices to bring up")
+        return UNKNOWN
+    bad = 0
+    for name, dev in sorted(devs.items()):
+        for pname, remote in sorted(reach.declared_ports(dev).items()):
+            local, state, detail = reach.open_forward(dev, remote)
+            if state == "failed":
+                bad += 1
+                print("%-10s %-8s FAILED  %s" % (name, pname, detail))
+            else:
+                print("%-10s %-8s %-7s http://127.0.0.1:%d" % (name, pname, state, local))
+    return FAIL if bad else PASS
+
+
+def cmd_status(args):
+    st = reach.status(probe="--probe" in args)
+    if "--json" in args:
+        print(json.dumps(st, indent=2))
+        return PASS
+    print("ce node: %s (%s)" % ("reachable" if st["node"]["reachable"] else "NOT reachable",
+                                st["node"]["detail"][:40]))
+    for d in st["devices"]:
+        print("%s  %d/%d ports forwarded" % (d["name"], d["reachable_ports"], len(d["ports"])))
+        for p in d["ports"]:
+            extra = ""
+            if p["http"]:
+                extra = "  HTTP %s in %s ms" % (p["http"]["status"] or "no answer", p["http"]["ms"])
+            print("    %-8s %-4s %s%s" % (p["port"], p["state"], p["url"] or "(ssh)", extra))
+    for n in st["notes"]:
+        print("note: %s: %s" % (n["source"], n["note"]))
+    return PASS if st["node"]["reachable"] else UNKNOWN
+
+
+def _resolve_port(dev, token):
+    ports = reach.declared_ports(dev)
+    if token in ports:
+        return ports[token]
+    try:
+        return int(token)
+    except ValueError:
+        sys.exit("reach: %r is not a declared port name (%s) nor a number"
+                 % (token, ", ".join(sorted(ports))))
+
+
+def cmd_port(args):
+    if len(args) != 2:
+        sys.exit("reach: port <device> <name|number>")
+    dev = _device(args[0])
+    remote = _resolve_port(dev, args[1])
+    local, state, detail = reach.open_forward(dev, remote)
+    if state == "failed":
+        print("reach: %s" % detail, file=sys.stderr)
+        return FAIL
+    print("http://127.0.0.1:%d" % local)
+    return PASS
+
+
+def cmd_ping(args):
+    if not args:
+        sys.exit("reach: ping <device> [port-name] [-n N] [--path /p]")
+    dev = _device(args[0])
+    rest = args[1:]
+    n, path = 20, "/"
+    if "-n" in rest:
+        n = int(rest[rest.index("-n") + 1])
+    if "--path" in rest:
+        path = rest[rest.index("--path") + 1]
+    named = [a for a in rest if not a.startswith("-") and not a.isdigit() and not a.startswith("/")]
+    # drop values that belong to -n / --path
+    if "-n" in rest and rest[rest.index("-n") + 1] in named:
+        named.remove(rest[rest.index("-n") + 1])
+    if "--path" in rest and rest[rest.index("--path") + 1] in named:
+        named.remove(rest[rest.index("--path") + 1])
+    ports = reach.declared_ports(dev)
+    token = named[0] if named else next((p for p in ports if p != "ssh"), None)
+    if token is None:
+        sys.exit("reach: %s declares no HTTP port to ping" % args[0])
+    remote = _resolve_port(dev, token)
+    local, state, detail = reach.open_forward(dev, remote)
+    if state == "failed":
+        print("reach: %s" % detail, file=sys.stderr)
+        return FAIL
+    url = "http://127.0.0.1:%d%s" % (local, path)
+    r = reach.latency(url, n=n)
+    print("%s %s over ce-net (%s): %s" % (args[0], token, url, r["verdict"]))
+    if r["p50_ms"] is None:
+        print("  no reply in %d tries" % n)
+        return UNKNOWN
+    print("  n=%d answered=%d  p50 %.1f ms  p90 %.1f ms  min %.1f  max %.1f"
+          % (r["n"], r["answered"], r["p50_ms"], r["p90_ms"], r["min_ms"], r["max_ms"]))
+    return PASS if r["verdict"] == "PASS" else UNKNOWN
+
+
+def cmd_get(args):
+    if len(args) < 3:
+        sys.exit("reach: get <device> <port-name> <path>")
+    dev = _device(args[0])
+    remote = _resolve_port(dev, args[1])
+    local, state, detail = reach.open_forward(dev, remote)
+    if state == "failed":
+        print("reach: %s" % detail, file=sys.stderr)
+        return FAIL
+    path = args[2] if args[2].startswith("/") else "/" + args[2]
+    import urllib.error
+    import urllib.request
+    url = "http://127.0.0.1:%d%s" % (local, path)
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            sys.stdout.write(r.read().decode("utf-8", "replace"))
+            if not sys.stdout.isatty():
+                return PASS
+            print()
+        return PASS
+    except urllib.error.HTTPError as e:
+        print("HTTP %d from %s" % (e.code, url), file=sys.stderr)
+        return FAIL
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        print("no answer from %s: %s" % (url, e), file=sys.stderr)
+        return UNKNOWN
+
+
+def cmd_down(args):
+    print("reach: a forward cannot be closed yet, and this says so rather than pretending.")
+    print("  The listener lives inside the ce node (POST /tunnel, ce/crates/ce-node/src/api.rs:983);")
+    print("  the node keeps no registry of open tunnels and exposes no close route.")
+    print("  What closes one today: restart the local node (`ce start` again).")
+    print("  The fix: a tunnels registry in ApiState plus GET /tunnels and DELETE /tunnel.")
+    return UNKNOWN
+
+
+def cmd_doctor(args):
+    bad = unknown = 0
+    up, detail = reach.node_up()
+    print("ce node %s: %s" % (reach.NODE_API, "OK %s" % detail[:16] if up else "NOT REACHABLE (%s)" % detail))
+    if not up:
+        bad += 1
+    devs, notes = reach.load_devices()
+    print("device tables: %d device(s)" % len(devs))
+    for n in notes:
+        print("  note: %s: %s" % (n.source, n.text))
+    if not devs:
+        unknown += 1
+    for name, dev in sorted(devs.items()):
+        missing = [k for k in ("wallet", "node_id") if not dev.get(k)]
+        if missing:
+            print("  %-10s INCOMPLETE: no %s" % (name, ", ".join(missing)))
+            bad += 1
+            continue
+        print("  %-10s wallet=%s node=%s" % (name, dev["wallet"], dev["node_id"][:12]))
+        for pname, remote in sorted(reach.declared_ports(dev).items()):
+            local = reach.local_port_for(dev, remote)
+            print("    %-8s :%-6s -> 127.0.0.1:%-6s %s"
+                  % (pname, remote, local, "up" if reach.listening(local) else "not forwarded"))
+    if bad:
+        return FAIL
+    return UNKNOWN if unknown else PASS
+
+
+def cmd_serve(args):
+    import reachd
+    port = int(args[0]) if args else int(os.environ.get("REACH_PORT", "8943"))
+    return reachd.serve(port)
+
+
+CMDS = {"ls": cmd_ls, "up": cmd_up, "status": cmd_status, "port": cmd_port,
+        "ping": cmd_ping, "get": cmd_get, "down": cmd_down, "doctor": cmd_doctor,
+        "serve": cmd_serve}
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return PASS
+    cmd = argv[0]
+    if cmd not in CMDS:
+        sys.exit("reach: no command %r (try: %s)" % (cmd, ", ".join(sorted(CMDS))))
+    return CMDS[cmd](argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

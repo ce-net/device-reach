@@ -1,0 +1,37 @@
+# Capability definitions OWNED by device-reach (the enforcer of device-reach:*).
+# The substrate matches opaque strings; the meaning lives here.
+#
+# These gate THIS app's own doors. They are not the capability that opens a
+# tunnel: that one is `tunnel`, issued by the target device and checked by the
+# ce node and by the device at the far end of the stream. Holding
+# device-reach:up without a `tunnel` grant for the target reaches nothing, and
+# that is the point of keeping the two apart.
+
+[[capability]]
+name = "device-reach:up"
+resource = "the set of loopback forwards this machine holds open"
+actions = [
+  "ask the local ce node to bind 127.0.0.1:<local> to <device>:<remote> over the mesh",
+]
+attenuation = "per-instance"
+caveats = [
+  "an open forward is reach: whoever can connect to that loopback port can speak to that port on that device",
+  "the forward still needs a `tunnel` capability for the target in the local wallet; without one the ce node refuses and this app reports the refusal",
+  "a forward cannot be closed again today (the ce node keeps no tunnel registry), so granting this grants reach until the node restarts",
+]
+never-grants = [
+  "driving anything on the far device: this app opens a path, it does not send commands",
+  "issuing or attenuating a `tunnel` capability",
+  "editing the device table",
+]
+
+[[capability]]
+name = "device-reach:down"
+resource = "the set of loopback forwards this machine holds open"
+actions = ["ask for a forward to be closed"]
+attenuation = "per-instance"
+caveats = [
+  "the route exists and is gated, and then answers CANNOT DETERMINE: the ce node exposes no close",
+  "it is defined now so that the day the node can close a tunnel, the door is already the right shape",
+]
+never-grants = ["stopping another app, or closing a forward another app opened by some other route"]

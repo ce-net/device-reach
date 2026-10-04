@@ -1,0 +1,59 @@
+[app]
+name = "device-reach"
+version = "0.1.0"
+summary = "net.device-reach: reach a named device's TCP ports over ce-net, peer-to-peer with relay fallback. A device is a name; its ports are names; `reach port huey servo` prints a loopback URL that goes to that machine wherever it is. The forward is bound by the local ce node (POST /tunnel, TCP-over-libp2p) and only with a `tunnel` capability for the target, so the authorization check stays where it already is. Owns no device record: it reads ce-devices' access.json and merges this machine's own additions. The Tailscale-shaped half of ce-net's data plane; the admin console half is net.console."
+runtime = "script"
+provides = ["net.device-reach"]
+repo = "https://github.com/ce-net/device-reach"
+license = "AGPL-3.0-or-later OR commercial (see LICENSING.md)"
+
+[script]
+interpreter = "python3"
+entry = "reachd.py"
+cli = "bin/reach"
+deps = ["ce-py"]
+
+[daemon]
+enabled = true
+args = ["8943"]
+restart = "always"
+
+# Loopback only. Talks to the local ce node and shells out to `ce tunnel`.
+[sandbox]
+tier = "none"
+net = "mesh-only"
+
+[deps]
+requires = ["native"]
+capabilities = ["device-reach:up", "device-reach:down"]
+
+[launch]
+contract = 1
+
+[launch.targets.reachd]
+summary     = "the net.device-reach daemon: keeps every declared forward bound and serves the machines page"
+supervision = "manual"
+cmd         = ["python3", "reachd.py", "8943"]
+cwd         = "."
+start_hint  = "python3 reachd.py 8943 in ~/dev/device-reach"
+node        = "local"
+
+[launch.targets.reachd.bind]
+port  = 8943
+hosts = ["127.0.0.1"]
+
+[launch.targets.reachd.stop]
+method       = "signal"
+signal       = "TERM"
+escalate     = true
+safe_to_stop = true
+
+[launch.targets.reachd.health]
+url           = "http://127.0.0.1:8943/api/health"
+expect_status = 200
+# Only this app emits its own interface name in its health body.
+expect_body   = "net.device-reach"
+# Negative control, measured 2026-10-04 21:44 with curl: this path answers 404
+# with {"error": "no_such_route"}, so the probe can go red. Checked in
+# tests/test_reach.py::Daemon::test_unknown_route_404s.
+expect_404    = "http://127.0.0.1:8943/api/no-such-route-xyz"
