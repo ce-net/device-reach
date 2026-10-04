@@ -211,6 +211,81 @@ def open_forward(dev, remote, local=None):
     return local, "failed", "ce tunnel returned 0 but 127.0.0.1:%d never bound" % local
 
 
+def udp_held(port):
+    """True when something holds 127.0.0.1:<port> for UDP.
+
+    A UDP socket and a TCP listener are different namespaces, so `listening()` would answer
+    a different question and answer it confidently. This binds a UDP socket and reads the
+    operating system's refusal.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind(("127.0.0.1", int(port)))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
+def wallet_cap(alias):
+    """(cap_hex, detail). The capability token this machine holds under an alias."""
+    try:
+        r = subprocess.run([CE_IAM, "wallet", "show", alias, "--json"],
+                           capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, "cannot run %s wallet show: %s" % (CE_IAM, e)
+    if r.returncode != 0:
+        return None, (r.stderr or r.stdout).strip()[:300]
+    try:
+        cap = (json.loads(r.stdout) or {}).get("cap")
+    except ValueError:
+        return None, "ce-iam wallet show %s did not answer JSON" % alias
+    return (cap, "") if cap else (None, "no capability token under alias %r" % alias)
+
+
+# POST /udp-tunnel does not exist on a node built before datagrams crossed the mesh. A 404 there
+# is a node too old to carry UDP, which is a different thing from a forward that failed.
+UDP_UNSUPPORTED = (
+    "this ce node cannot forward datagrams: POST /udp-tunnel answered 404. UDP over the mesh is "
+    "ce/crates/ce-node/src/api.rs (POST /udp-tunnel) and /ce/udp/1 in ce-mesh, on branch "
+    "udp-tunnel."
+)
+
+
+def open_udp_forward(dev, remote, local=None):
+    """Make 127.0.0.1:<local> reach the device's <remote> UDP port over ce-net.
+
+    (local_port, state, detail), state one of `already` | `opened` | `failed` | `unsupported`.
+    Unlike the TCP path this talks to the node API directly, because `ce tunnel` is TCP only;
+    the capability comes from the same wallet alias, so the node still has exactly one place
+    that can say yes.
+    """
+    local = local or local_port_for(dev, remote)
+    if udp_held(local):
+        return local, "already", "udp 127.0.0.1:%d was already bound" % local
+    node = dev.get("node_id")
+    if not node:
+        return local, "failed", "device has no node id"
+    cap, detail = (None, "")
+    if dev.get("wallet"):
+        cap, detail = wallet_cap(dev["wallet"])
+    body = {"node_id": node, "local_port": int(local), "remote_port": int(remote)}
+    if cap:
+        body["caps"] = cap
+    status, doc, why = _node_json("/udp-tunnel", "POST", body, timeout=30.0)
+    if status == 404:
+        return local, "unsupported", UDP_UNSUPPORTED
+    if status == 409:
+        return local, "failed", (doc or {}).get("error") or "127.0.0.1:%d is already forwarded" % local
+    if status != 200:
+        return local, "failed", why or "POST /udp-tunnel answered %s: %s" % (status, doc)
+    if not udp_held(local):
+        return local, "failed", "the node answered 200 but udp 127.0.0.1:%d never bound" % local
+    return local, "opened", "bound udp 127.0.0.1:%d -> %s:%d%s" % (
+        local, node[:12], int(remote), "" if cap else " (no capability attached: " + detail + ")")
+
+
 def _data_dir():
     """The ce data dir, where the node writes api.token."""
     if os.environ.get("CE_DATA_DIR"):

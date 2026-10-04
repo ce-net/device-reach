@@ -9,6 +9,7 @@
   reach get <device> <name> <path>   read-only GET through the forward
   reach down <device> [port]    close those forwards and free the ports (`--all` for every one)
   reach path [--json]           every mesh peer: RTT, direct or relayed, and which device
+  reach udp <device> <port>     forward a UDP port (datagrams) and print 127.0.0.1:<local>
   reach policy [--json]         what each device's grant SHOULD be, against what is held
   reach doctor                  node, tables, wallet, every forward, with reasons
   reach serve [port]            run the daemon + web page (default 8943)
@@ -259,6 +260,34 @@ def cmd_path(args):
     return PASS
 
 
+def cmd_udp(args):
+    """Forward a device's UDP port. Datagrams, not a byte stream."""
+    if len(args) < 2:
+        sys.exit("usage: reach udp <device> <port name or number>")
+    name, which = args[0], args[1]
+    dev = _device(name)
+    ports = reach.declared_ports(dev)
+    udp = dev.get("udp_ports") or {}
+    if which in udp:
+        remote = int(udp[which])
+    elif which in ports:
+        remote = int(ports[which])
+    elif which.isdigit():
+        remote = int(which)
+    else:
+        sys.exit("reach: %s has no port %r (declared: %s)"
+                 % (name, which, ", ".join(sorted(set(ports) | set(udp))) or "none"))
+    local, state, detail = reach.open_udp_forward(dev, remote)
+    if state == "unsupported":
+        print("CANNOT DETERMINE: %s" % detail)
+        return UNKNOWN
+    if state == "failed":
+        print("FAIL: %s" % detail)
+        return FAIL
+    print("127.0.0.1:%d  (udp, %s)" % (local, detail))
+    return PASS
+
+
 def cmd_policy(args):
     """Hold every held capability against what the policy says it should be. Measures only."""
     if "--example" in args:
@@ -345,7 +374,7 @@ def cmd_serve(args):
 
 
 CMDS = {"ls": cmd_ls, "up": cmd_up, "status": cmd_status, "port": cmd_port,
-        "ping": cmd_ping, "get": cmd_get, "down": cmd_down, "path": cmd_path, "policy": cmd_policy,
+        "ping": cmd_ping, "get": cmd_get, "down": cmd_down, "path": cmd_path, "udp": cmd_udp, "policy": cmd_policy,
         "doctor": cmd_doctor,
         "serve": cmd_serve}
 

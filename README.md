@@ -51,6 +51,7 @@ here.
 | `reach get <device> <port> <path>` | a read-only GET through the forward |
 | `reach down <device> [port]` / `--all` | close those forwards and free the ports; on a node without the close route it says so |
 | `reach path [--json]` | every mesh peer: measured RTT, how many samples, and whether the path is direct or relayed |
+| `reach udp <device> <port>` | forward a UDP port; prints `127.0.0.1:<local>` for datagrams |
 | `reach policy [--json]` / `--example` | every held capability against what the policy says it should be |
 | `reach doctor` | node, tables, wallet, every forward, with reasons |
 | `reach serve [port]` | the daemon and its machines page (default 8943) |
@@ -175,6 +176,35 @@ Three things it refuses to be relaxed about:
 - **A grant outside the policy is listed, not judged.** Other apps' capabilities are not this
   app's business, but they are not invisible either.
 
+## Datagrams — `reach udp`
+
+TCP is not the whole network. DNS-SD, NTP, syslog, an OSC controller and most telemetry are
+datagrams, and a byte stream cannot carry them: a forward that reassembles datagrams into a
+stream changes the message boundaries, which is the one property those protocols rely on.
+
+```bash
+reach udp huey 5353
+# 127.0.0.1:15353  ->  huey:5353/udp   (opened)
+dig -p 15353 @127.0.0.1 _services._dns-sd._udp.local PTR
+```
+
+The mesh side is a second protocol, `/ce/udp/1`, beside `/ce/tunnel/1`. Both open with the
+same authorized header, so the same `tunnel` capability covers both and no new grant is
+needed. On the wire each datagram is length-prefixed, because a libp2p stream is a byte
+stream and a 1472-byte packet followed by a 68-byte packet must arrive as two packets, not as
+one 1540-byte blob. A datagram larger than 65507 bytes is refused rather than split, and an
+idle flow is dropped after 120 s so a port scan cannot pin memory.
+
+Three things it refuses to claim:
+
+- **A 200 from the node is not a bound port.** After the node answers, `reach udp` tries to
+  bind the loopback port itself; if that succeeds, nothing is listening and the forward is a
+  **FAIL**, named. This exact guard was proven by removing it: two tests went red.
+- **A node without the route says so.** `POST /udp-tunnel` answering 404 is CANNOT DETERMINE
+  with the branch named, exit 2 — never "opened".
+- **It is a forward, not a subnet.** One remote port to one loopback port. No broadcast, no
+  multicast group join on the far side, no exit node.
+
 ## Devices
 
 It owns no device record. It reads, in order:
@@ -214,7 +244,12 @@ different ports would open two forwards to one place.
   proxy-aware client can use, but a client that ignores `http_proxy` still needs the loopback
   port. Closing that needs a loopback alias per device (`ifconfig lo0 alias`), which needs
   root, and asking for root to read a leg angle is the wrong trade.
-- **TCP only.** `/ce/tunnel/1` splices TCP. No UDP, no subnet routes, no exit node.
+- **UDP needs a node that has `/ce/udp/1`.** `reach udp` works against a node built from
+  branch `udp-tunnel` of the `ce` repo; against today's node it answers CANNOT DETERMINE with
+  the 404 quoted, which is what this machine's node still does. Measured end to end against a
+  fake node in the test suite, not yet against a deployed one.
+- **No subnet routes and no exit node.** A forward is one port to one port, by name. Routing a
+  whole /24, or sending default traffic through a device, is not in scope.
 - **No relayed path measured.** Both devices tested are on one Wi-Fi, so both directions were
   direct libp2p. The relay fallback is unproven here.
 
@@ -232,7 +267,7 @@ but a ce node.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests          # 22, no network needed
+python3 -m unittest discover -s tests          # 59, no network needed
 REACH_LIVE=1 python3 -m unittest discover -s tests   # also reaches Huey for real
 ```
 

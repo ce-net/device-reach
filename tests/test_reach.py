@@ -13,6 +13,7 @@ failure looks like success is not a control.
 import json
 import os
 import sys
+import socket
 import tempfile
 import time
 import threading
@@ -38,6 +39,14 @@ TABLE = {
                 "wallet": "big", "node_id": "cd" * 32, "ports": {"web": 18080}},
     }
 }
+
+
+def _free_udp_port():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
 
 
 class TempTable:
@@ -218,10 +227,12 @@ class FakeNode:
     node built before the close route. Otherwise it is the list of open forwards.
     """
 
-    def __init__(self, tunnels=None, token="tok", netgraph=None):
+    def __init__(self, tunnels=None, token="tok", netgraph=None, udp=False):
         self.tunnels = tunnels
         self.token = token
         self.netgraph = netgraph
+        self.udp = udp            # False = a node built before datagrams crossed the mesh
+        self.udp_opened = []
         self.deleted = []
         outer = self
 
@@ -249,6 +260,21 @@ class FakeNode:
                 if self.path == "/status":
                     return self._send(200, {"node_id": "ab" * 32})
                 self._send(404, {"error": "no such route"})
+
+            def do_POST(self):
+                if self.path != "/udp-tunnel":
+                    return self._send(404, {"error": "no such route"})
+                if not outer.udp:
+                    return self._send(404, {"error": "no such route"})
+                auth = self.headers.get("Authorization") or ""
+                if auth != "Bearer " + outer.token:
+                    return self._send(401, {"error": "missing or invalid API token"})
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n))
+                outer.udp_opened.append(body)
+                self._send(200, {"proto": "udp", "local_port": body["local_port"],
+                                 "remote_port": body["remote_port"],
+                                 "node_id": body["node_id"]})
 
             def do_DELETE(self):
                 auth = self.headers.get("Authorization") or ""
@@ -499,6 +525,67 @@ def grant(alias, node, abilities, ports=None, not_after=0, nonce=7):
                       "root_issuer": node, "links": [link]}}
 
 
+class Udp(unittest.TestCase):
+    NODE = "75" * 32
+    TABLE = {"devices": {"huey": {"what": "the duck", "wallet": "huey", "node_id": NODE,
+                                  "ports": {"servo": 8938}, "udp_ports": {"dns": 5353}}}}
+
+    def dev(self):
+        with TempTable(self.TABLE, names=False):
+            devs, _ = reach.load_devices()
+        return devs["huey"]
+
+    def test_a_node_without_the_route_is_unsupported_not_a_failed_forward(self):
+        """404 on POST /udp-tunnel means the node is too old to carry datagrams. Reporting
+        that as a failed forward would send someone looking at the duck."""
+        with FakeNode(udp=False):
+            local, state, detail = reach.open_udp_forward(self.dev(), 5353)
+        self.assertEqual(state, "unsupported")
+        self.assertIn("udp-tunnel", detail)
+
+    def test_a_udp_port_already_bound_is_already_not_reopened(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        held = s.getsockname()[1]
+        try:
+            with FakeNode(udp=True) as node:
+                local, state, detail = reach.open_udp_forward(self.dev(), 5353, local=held)
+            self.assertEqual(state, "already")
+            self.assertEqual(node.udp_opened, [], "nothing was asked of the node")
+        finally:
+            s.close()
+
+    def test_a_udp_forward_the_node_claims_but_did_not_bind_is_a_failure(self):
+        """The node answering 200 is not the measurement. The socket is."""
+        free = _free_udp_port()
+        with FakeNode(udp=True):
+            local, state, detail = reach.open_udp_forward(self.dev(), 5353, local=free)
+        self.assertEqual(state, "failed", detail)
+        self.assertIn("never bound", detail)
+
+    def test_the_request_carries_the_node_id_and_the_capability(self):
+        free = _free_udp_port()
+        with TempTable(self.TABLE, names=False), FakeCeIam([]), FakeNode(udp=True) as node:
+            reach.open_udp_forward(self.dev(), 5353, local=free)
+        self.assertEqual(len(node.udp_opened), 1)
+        sent = node.udp_opened[0]
+        self.assertEqual(sent["node_id"], self.NODE)
+        self.assertEqual(sent["remote_port"], 5353)
+
+    def test_udp_and_tcp_are_different_namespaces(self):
+        """udp_held must not answer about TCP. A TCP listener on a port leaves the UDP port
+        free, and a check that confused them would report a forward that is not there."""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        p = srv.getsockname()[1]
+        try:
+            self.assertTrue(reach.listening(p), "tcp is held")
+            self.assertFalse(reach.udp_held(p), "udp of the same number is not")
+        finally:
+            srv.close()
+
+
 class Policy(unittest.TestCase):
     """A capability nobody looks at is the one that stays too wide. These check that the
     looking is real: a wider grant must fail, and a missing field must not read as a limit."""
@@ -620,7 +707,7 @@ class Paths(unittest.TestCase):
         tbl = {"devices": {"mine": {"what": "this machine", "wallet": "w",
                                     "node_id": self.NODE, "ports": {"api": 1}}}}
         rows = [{"peer": self.PEER, "rtt_ms": 0.9, "samples": 120, "last_seen_secs": 1,
-                 "addr": "/ip4/192.168.1.9/tcp/4001", "relayed": False},
+                 "addr": "/ip4/198.51.100.9/tcp/4001", "relayed": False},
                 {"peer": "12D3KooWHkCw1zQX67N444WUVQokFy5hPVougDGKRJsMxoyoBYMS",
                  "rtt_ms": 79.3, "samples": 6157, "last_seen_secs": 1,
                  "addr": "/ip4/1.2.3.4/tcp/4001/p2p/QmR/p2p-circuit/p2p/QmT", "relayed": True}]
