@@ -20,6 +20,7 @@ What it is not: a transparent VPN. A client that does not honour a proxy still n
 loopback port. That gap closes with a per-device loopback alias, which needs root.
 """
 
+import json
 import os
 import re
 import select
@@ -41,6 +42,8 @@ AUTHORITY_RE = re.compile(r"^(?P<host>[^:]+):(?P<port>\d+)$")
 HOP_BY_HOP = {"proxy-connection", "proxy-authorization", "connection", "keep-alive",
               "te", "trailer", "transfer-encoding", "upgrade"}
 IDLE_S = float(os.environ.get("REACH_PROXY_IDLE_S", "300"))
+HEALTH_PATH = "/healthz"
+HEALTH_MARKER = "net.device-reach proxy"
 
 _stats = {"requests": 0, "connect": 0, "refused": 0}
 
@@ -106,6 +109,16 @@ class Handler(socketserver.StreamRequestHandler):
         except OSError:
             pass
 
+    def _health(self):
+        """The one origin-form path this proxy answers about itself."""
+        body = json.dumps({"app": HEALTH_MARKER, "ok": True, "stats": dict(_stats)}).encode()
+        try:
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\n"
+                b"Connection: close\r\n\r\n" % len(body) + body)
+        except OSError:
+            pass
+
     def handle(self):
         try:
             line = self.rfile.readline(8192).decode("latin-1").rstrip("\r\n")
@@ -134,6 +147,11 @@ class Handler(socketserver.StreamRequestHandler):
 
         u = ABS_RE.match(target)
         if not u:
+            # One origin-form path answers about the proxy itself, so a monitor has
+            # something it can read. Everything else in origin form is an error, which
+            # is what makes that one path a falsifiable probe rather than a catch-all.
+            if method == "GET" and target.split("?", 1)[0] == HEALTH_PATH:
+                return self._health()
             return self._refuse(
                 400, "this is a proxy: the request line needs an absolute URI "
                      "(http://<device>:<port>/path), got %r" % target[:80])

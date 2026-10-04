@@ -130,6 +130,18 @@ class ProxyCase(unittest.TestCase):
         self.assertIn(b"400", r.split(b"\r\n")[0])
         self.assertIn(b"absolute URI", r)
 
+    def test_healthz_is_the_one_origin_form_path_and_names_this_app(self):
+        r = self.speak(b"GET /healthz HTTP/1.1\r\n\r\n")
+        self.assertIn(b"200", r.split(b"\r\n")[0])
+        self.assertIn(b"net.device-reach proxy", r)
+
+    def test_the_negative_control_path_is_not_a_200(self):
+        """A probe that cannot go red is a decoration: /healthz must not be a catch-all."""
+        r = self.speak(b"GET /definitely-not-a-route-xyz HTTP/1.1\r\n\r\n")
+        self.assertNotIn(b"200", r.split(b"\r\n")[0])
+        self.assertIn(b"400", r.split(b"\r\n")[0])
+        self.assertNotIn(b"net.device-reach proxy", r)
+
     def test_garbage_does_not_crash_the_proxy(self):
         self.speak(b"\x00\x01 not http at all\r\n\r\n")
         # Still serving afterwards: the real assertion.

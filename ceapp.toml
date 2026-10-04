@@ -57,3 +57,33 @@ expect_body   = "net.device-reach"
 # with {"error": "no_such_route"}, so the probe can go red. Checked in
 # tests/test_reach.py::Daemon::test_unknown_route_404s.
 expect_404    = "http://127.0.0.1:8943/api/no-such-route-xyz"
+
+[launch.targets.proxy]
+summary     = "the name proxy: huey:8940 is a real address for any proxy-aware client (http_proxy=http://127.0.0.1:8944)"
+supervision = "manual"
+cmd         = ["python3", "proxy.py", "8944"]
+cwd         = "."
+start_hint  = "python3 proxy.py 8944 in ~/dev/device-reach"
+node        = "local"
+
+[launch.targets.proxy.bind]
+port  = 8944
+hosts = ["127.0.0.1"]
+
+[launch.targets.proxy.stop]
+method       = "signal"
+signal       = "TERM"
+escalate     = true
+safe_to_stop = true
+
+[launch.targets.proxy.health]
+# An HTTP proxy expects absolute-URI request lines, so origin form is normally an
+# error. /healthz is the single carved-out exception, which is exactly what makes
+# the negative control below meaningful.
+url           = "http://127.0.0.1:8944/healthz"
+expect_status = 200
+expect_body   = "net.device-reach proxy"
+# Negative control, measured 2026-10-04 23:4x with curl: this path answers 400 with
+# "the request line needs an absolute URI", NOT 200, so the probe can go red.
+# Checked in tests/test_proxy.py::ProxyCase::test_the_negative_control_path_is_not_a_200.
+expect_404    = "http://127.0.0.1:8944/definitely-not-a-route-xyz"
