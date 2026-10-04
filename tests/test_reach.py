@@ -32,7 +32,7 @@ TABLE = {
     "devices": {
         "huey": {"what": "test duck", "wallet": "huey", "node_id": "ab" * 32,
                  "user": "arduino", "key": "~/.ssh/nope", "ssh_local": 2238,
-                 "lan": "192.168.1.115", "ports": {"servo": 8938, "walk": 8940}},
+                 "lan": "192.168.1.x", "ports": {"servo": 8938, "walk": 8940}},
         "big": {"what": "a device whose port is already above 10000",
                 "wallet": "big", "node_id": "cd" * 32, "ports": {"web": 18080}},
     }
