@@ -7,7 +7,7 @@
   reach port <device> <name>    one port; prints http://127.0.0.1:<local>
   reach ping <device> [name]    p50/p90 over the forward (default 20 GETs)
   reach get <device> <name> <path>   read-only GET through the forward
-  reach down [device]           say what closing would take (see README, it cannot yet)
+  reach down <device> [port]    close those forwards and free the ports (`--all` for every one)
   reach doctor                  node, tables, wallet, every forward, with reasons
   reach serve [port]            run the daemon + web page (default 8943)
 
@@ -182,12 +182,47 @@ def cmd_get(args):
 
 
 def cmd_down(args):
-    print("reach: a forward cannot be closed yet, and this says so rather than pretending.")
-    print("  The listener lives inside the ce node (POST /tunnel, ce/crates/ce-node/src/api.rs:983);")
-    print("  the node keeps no registry of open tunnels and exposes no close route.")
-    print("  What closes one today: restart the local node (`ce start` again).")
-    print("  The fix: a tunnels registry in ApiState plus GET /tunnels and DELETE /tunnel.")
-    return UNKNOWN
+    """reach down [device] [port] | --all — stop forwards and free the ports."""
+    rows, supported, detail = reach.node_tunnels()
+    if supported is False:
+        print("reach: %s" % detail)
+        print("  What frees a port on this node today: restart it.")
+        return UNKNOWN
+    if supported is None:
+        print("reach: cannot read the node's forwards: %s" % detail)
+        return UNKNOWN
+
+    want = [a for a in args if a != "--all"]
+    if not want and "--all" not in args:
+        sys.exit("reach: down <device> [port] | down --all  (nothing closed; say what to close)")
+
+    if want:
+        dev = _device(want[0])
+        ports = reach.declared_ports(dev)
+        if len(want) > 1:
+            remote = _resolve_port(dev, want[1])
+            targets = {reach.local_port_for(dev, remote)}
+        else:
+            targets = {reach.local_port_for(dev, p) for p in ports.values()}
+    else:
+        targets = {int(r["local_port"]) for r in rows}
+
+    held = {int(r["local_port"]) for r in rows}
+    todo = sorted(targets & held)
+    skipped = sorted(targets - held)
+    if not todo:
+        print("nothing to close: the node holds no forward on %s"
+              % (", ".join(str(p) for p in skipped) or "any matching port"))
+        return PASS
+    bad = 0
+    for p in todo:
+        ok, why = reach.close_forward(p)
+        print("%-6s %s" % (p, why))
+        if not ok:
+            bad += 1
+    for p in skipped:
+        print("%-6s not forwarded by this node, nothing to close" % p)
+    return FAIL if bad else PASS
 
 
 def cmd_doctor(args):
@@ -201,6 +236,20 @@ def cmd_doctor(args):
     for n in notes:
         print("  note: %s: %s" % (n.source, n.text))
     if not devs:
+        unknown += 1
+    tok, tok_detail = reach.node_api_token()
+    print("node API token: %s" % ("present (%s)" % tok_detail if tok else "MISSING — %s" % tok_detail))
+    if not tok:
+        unknown += 1
+    rows, supported, why = reach.node_tunnels()
+    if supported is True:
+        print("close route: present, %d forward(s) held by the node" % len(rows))
+    elif supported is False:
+        print("close route: ABSENT — a forward on this node cannot be closed")
+        print("  %s" % why)
+        unknown += 1
+    else:
+        print("close route: cannot determine (%s)" % why)
         unknown += 1
     for name, dev in sorted(devs.items()):
         missing = [k for k in ("wallet", "node_id") if not dev.get(k)]

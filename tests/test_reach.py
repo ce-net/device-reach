@@ -18,7 +18,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.insert(0, HERE)
@@ -130,6 +130,118 @@ class Forwards(unittest.TestCase):
             reach.CE = old
         self.assertEqual(state, "failed")
         self.assertIn("PATH", detail)
+
+
+class FakeNode:
+    """A stand-in ce node, so the close path can be tested on both node generations.
+
+    `tunnels` None means a node with no registry: /tunnels 404s, which is the state of every
+    node built before the close route. Otherwise it is the list of open forwards.
+    """
+
+    def __init__(self, tunnels=None, token="tok"):
+        self.tunnels = tunnels
+        self.token = token
+        self.deleted = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _send(self, code, obj):
+                b = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(b)))
+                self.end_headers()
+                self.wfile.write(b)
+
+            def do_GET(self):
+                if self.path == "/tunnels":
+                    if outer.tunnels is None:
+                        return self._send(404, {"error": "no such route"})
+                    return self._send(200, outer.tunnels)
+                if self.path == "/status":
+                    return self._send(200, {"node_id": "ab" * 32})
+                self._send(404, {"error": "no such route"})
+
+            def do_DELETE(self):
+                auth = self.headers.get("Authorization") or ""
+                if auth != "Bearer " + outer.token:
+                    return self._send(401, {"error": "missing or invalid API token"})
+                if outer.tunnels is None:
+                    return self._send(404, {"error": "no such route"})
+                n = int(self.headers.get("Content-Length") or 0)
+                port = json.loads(self.rfile.read(n))["local_port"]
+                row = next((t for t in outer.tunnels if t["local_port"] == port), None)
+                if row is None:
+                    return self._send(404, {"error": "this node holds no forward on 127.0.0.1:%d" % port})
+                outer.tunnels.remove(row)
+                outer.deleted.append(port)
+                self._send(200, {"closed": True, "local_port": port,
+                                 "remote_port": row["remote_port"], "node_id": row["node_id"],
+                                 "conns": row.get("conns", 0), "open_for_secs": 3})
+
+        self.srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.port = self.srv.server_address[1]
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def __enter__(self):
+        self.old = (reach.NODE_API, os.environ.get("CE_API_TOKEN"))
+        reach.NODE_API = "http://127.0.0.1:%d" % self.port
+        os.environ["CE_API_TOKEN"] = self.token
+        return self
+
+    def __exit__(self, *a):
+        reach.NODE_API = self.old[0]
+        if self.old[1] is None:
+            os.environ.pop("CE_API_TOKEN", None)
+        else:
+            os.environ["CE_API_TOKEN"] = self.old[1]
+        self.srv.shutdown()
+        self.srv.server_close()
+
+
+class Closing(unittest.TestCase):
+    def test_a_node_without_the_registry_is_named_not_reported_as_empty(self):
+        """The failure this guards: 404 read as 'no tunnels open' would silently do nothing."""
+        with FakeNode(tunnels=None):
+            rows, supported, detail = reach.node_tunnels()
+        self.assertEqual(rows, [])
+        self.assertIs(supported, False)
+        self.assertIn("no tunnel registry", detail)
+
+    def test_closing_on_a_node_without_the_registry_refuses(self):
+        with FakeNode(tunnels=None):
+            ok, why = reach.close_forward(18938)
+        self.assertFalse(ok)
+        self.assertIn("cannot be closed", why)
+
+    def test_a_forward_is_listed_and_then_closed(self):
+        rows = [{"local_port": 18938, "remote_port": 8938, "node_id": "ab" * 32, "conns": 4}]
+        with FakeNode(tunnels=rows) as node:
+            got, supported, _ = reach.node_tunnels()
+            self.assertIs(supported, True)
+            self.assertEqual(got[0]["local_port"], 18938)
+            ok, why = reach.close_forward(18938)
+            self.assertTrue(ok, why)
+            self.assertIn("closed 127.0.0.1:18938", why)
+            self.assertEqual(node.deleted, [18938])
+            self.assertEqual(reach.node_tunnels()[0], [])
+
+    def test_closing_a_port_the_node_does_not_hold_is_refused_by_name(self):
+        with FakeNode(tunnels=[]):
+            ok, why = reach.close_forward(65432)
+        self.assertFalse(ok)
+        self.assertIn("no forward on 127.0.0.1:65432", why)
+
+    def test_without_a_token_the_close_is_refused_not_silently_skipped(self):
+        with FakeNode(tunnels=[{"local_port": 18938, "remote_port": 8938, "node_id": "ab", "conns": 0}]):
+            os.environ["CE_API_TOKEN"] = "wrong"
+            ok, why = reach.close_forward(18938)
+        self.assertFalse(ok)
+        self.assertIn("API token", why)
 
 
 class Latency(unittest.TestCase):

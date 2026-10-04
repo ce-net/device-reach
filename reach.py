@@ -154,6 +154,87 @@ def open_forward(dev, remote, local=None):
     return local, "failed", "ce tunnel returned 0 but 127.0.0.1:%d never bound" % local
 
 
+def _data_dir():
+    """The ce data dir, where the node writes api.token."""
+    if os.environ.get("CE_DATA_DIR"):
+        return os.environ["CE_DATA_DIR"]
+    mac = os.path.expanduser("~/Library/Application Support/ce")
+    return mac if os.path.isdir(mac) else os.path.expanduser("~/.local/share/ce")
+
+
+def node_api_token():
+    """(token, detail). The node gates every non-GET on this; a missing one is named."""
+    if os.environ.get("CE_API_TOKEN"):
+        return os.environ["CE_API_TOKEN"], "from CE_API_TOKEN"
+    path = os.path.join(_data_dir(), "api.token")
+    try:
+        with open(path) as f:
+            t = f.read().strip()
+        return (t, path) if t else (None, "%s is empty" % path)
+    except OSError as e:
+        return None, "cannot read %s: %s" % (path, e)
+
+
+def _node_json(path, method="GET", body=None, timeout=6.0):
+    """(status, doc, detail) against the local node API. Never raises."""
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(NODE_API + path, data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+        token, detail = node_api_token()
+        if not token:
+            return None, None, "no node API token (%s); the node refuses every non-GET" % detail
+        req.add_header("Authorization", "Bearer " + token)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            raw = r.read().decode()
+            return r.status, (json.loads(raw) if raw.strip() else None), ""
+    except urllib.error.HTTPError as e:
+        raw = e.read().decode("utf-8", "replace")
+        try:
+            return e.code, json.loads(raw), ""
+        except ValueError:
+            return e.code, None, raw[:300]
+    except (urllib.error.URLError, OSError, ValueError, TimeoutError) as e:
+        return None, None, str(e)[:200]
+
+
+# The node answers 404 on /tunnels until it carries the tunnel registry. That is a node too old
+# to close a forward, and it is reported as such rather than as "no tunnels open".
+CLOSE_UNSUPPORTED = (
+    "this ce node has no tunnel registry: GET /tunnels answered 404. A forward on such a node "
+    "cannot be closed and lasts until the node restarts. The route is "
+    "ce/crates/ce-node/src/api.rs (GET /tunnels, DELETE /tunnel) on branch tunnel-close."
+)
+
+
+def node_tunnels():
+    """(rows, supported, detail). Every forward the local node holds, or why we cannot know."""
+    status, doc, detail = _node_json("/tunnels")
+    if status == 404:
+        return [], False, CLOSE_UNSUPPORTED
+    if status != 200 or not isinstance(doc, list):
+        return [], None, detail or "GET /tunnels answered %s" % status
+    return doc, True, ""
+
+
+def close_forward(local_port):
+    """(ok, detail). Stop forwarding a local port and free it, or say why not."""
+    status, doc, detail = _node_json("/tunnel", "DELETE", {"local_port": int(local_port)})
+    if status == 200:
+        d = doc or {}
+        return True, "closed 127.0.0.1:%s -> %s:%s after %ss and %s connection(s)" % (
+            local_port, (d.get("node_id") or "?")[:12], d.get("remote_port"),
+            d.get("open_for_secs"), d.get("conns"))
+    if status == 404:
+        if isinstance(doc, dict) and "no forward" in str(doc.get("error", "")):
+            return False, "the node holds no forward on 127.0.0.1:%s" % local_port
+        return False, CLOSE_UNSUPPORTED
+    if status == 401:
+        return False, "the node refused: no API token (see `reach doctor`)"
+    return False, detail or "DELETE /tunnel answered %s: %s" % (status, doc)
+
+
 def http_probe(url, timeout=5.0):
     """(status, seconds, detail). status is an int, or None when it did not answer."""
     t = time.perf_counter()

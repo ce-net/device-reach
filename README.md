@@ -49,7 +49,7 @@ here.
 | `reach port <device> <name>` | one port; prints `http://127.0.0.1:<local>` |
 | `reach ping <device> [port] [--path /p] [-n 30]` | p50/p90 over the forward, or CANNOT DETERMINE |
 | `reach get <device> <port> <path>` | a read-only GET through the forward |
-| `reach down` | says what closing would take, and refuses to pretend (see Limits) |
+| `reach down <device> [port]` / `--all` | close those forwards and free the ports; on a node without the close route it says so |
 | `reach doctor` | node, tables, wallet, every forward, with reasons |
 | `reach serve [port]` | the daemon and its machines page (default 8943) |
 
@@ -110,10 +110,13 @@ different ports would open two forwards to one place.
 
 ## Limits, stated
 
-- **A forward cannot be closed.** The listener lives inside the ce node (`POST /tunnel`), which
-  keeps no registry of open tunnels and exposes no close route. Restarting the node is the only
-  way today. `reach down` says this instead of printing "closed". The fix is a tunnels registry
-  in `ApiState` plus `GET /tunnels` and `DELETE /tunnel` in `ce/crates/ce-node/src/api.rs`.
+- **A forward can only be closed on a node that has the close route.** The listener lives
+  inside the ce node, which until recently kept no registry of open tunnels. `reach down` and
+  `reach doctor` read `GET /tunnels`: on a node that answers 404 they say the forward cannot be
+  closed and that restarting the node is the only way, rather than printing "closed" while the
+  listener stays bound. The route (a tunnels registry in `ApiState`, `GET /tunnels`,
+  `DELETE /tunnel`) is written and tested on branch `tunnel-close` of the `ce` repo and ships
+  with the next node build.
 - **No per-device IP and no DNS.** You reach `127.0.0.1:18940`, not `huey:8940`. `ce-iam name`
   holds the naming half already and has no bindings yet.
 - **TCP only.** `/ce/tunnel/1` splices TCP. No UDP, no subnet routes, no exit node.
