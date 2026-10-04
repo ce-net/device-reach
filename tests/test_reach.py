@@ -60,7 +60,7 @@ class TempTable:
 class Tables(unittest.TestCase):
     def test_loads_devices_and_notes_nothing_when_fine(self):
         with TempTable():
-            devs, notes = reach.load_devices()
+            devs, notes = reach.load_devices(names=False)
         self.assertEqual(sorted(devs), ["big", "huey"])
         self.assertEqual(notes, [], "a healthy table must leave no note")
 
@@ -68,7 +68,7 @@ class Tables(unittest.TestCase):
         old = reach.CE_DEV_TABLE
         reach.CE_DEV_TABLE = "/nope/does/not/exist.json"
         try:
-            devs, notes = reach.load_devices()
+            devs, notes = reach.load_devices(names=False)
         finally:
             reach.CE_DEV_TABLE = old
         self.assertEqual(devs, {})
@@ -82,7 +82,7 @@ class Tables(unittest.TestCase):
             old = reach.CE_DEV_TABLE
             reach.CE_DEV_TABLE = p
             try:
-                devs, notes = reach.load_devices()
+                devs, notes = reach.load_devices(names=False)
             finally:
                 reach.CE_DEV_TABLE = old
         self.assertEqual(devs, {})
@@ -90,8 +90,75 @@ class Tables(unittest.TestCase):
 
     def test_the_optional_local_table_absent_is_not_a_note(self):
         with TempTable():
-            _, notes = reach.load_devices()
+            _, notes = reach.load_devices(names=False)
         self.assertEqual(notes, [])
+
+
+class FakeCeIam:
+    """A stand-in `ce-iam`, so the signed-name source is testable without the real one."""
+
+    def __init__(self, lines, rc=0):
+        self.script = "#!/bin/sh\ncat <<'EOF'\n%s\nEOF\nexit %d\n" % ("\n".join(lines), rc)
+
+    def __enter__(self):
+        self.dir = tempfile.TemporaryDirectory()
+        p = os.path.join(self.dir.name, "ce-iam")
+        with open(p, "w") as f:
+            f.write(self.script)
+        os.chmod(p, 0o755)
+        self.old = reach.CE_IAM
+        reach.CE_IAM = p
+        return self
+
+    def __exit__(self, *a):
+        reach.CE_IAM = self.old
+        self.dir.cleanup()
+
+
+class Names(unittest.TestCase):
+    LINE = ("huey                 -> " + "75" * 32 +
+            "  issuer 0e95015b…  expires 1822659205")
+
+    def test_a_signed_binding_becomes_a_reachable_device(self):
+        with FakeCeIam([self.LINE]), TempTable():
+            reach.CE_DEV_TABLE = "/nope/absent.json"  # names only
+            devs, _ = reach.load_devices()
+        self.assertIn("huey", devs)
+        self.assertEqual(devs["huey"]["node_id"], "75" * 32)
+        self.assertTrue(devs["huey"]["name_bound"])
+
+    def test_a_name_only_device_declares_no_ports(self):
+        """Not even ssh: the binding says which node, never what it serves."""
+        with FakeCeIam([self.LINE]):
+            bound, note = reach.name_bindings()
+        self.assertIsNone(note)
+        dev = {"node_id": bound["huey"], "_source": "ce-iam name"}
+        self.assertEqual(reach.declared_ports(dev), {})
+
+    def test_a_disagreement_keeps_the_table_and_leaves_a_note(self):
+        with FakeCeIam([self.LINE]), TempTable():
+            devs, notes = reach.load_devices()
+        self.assertEqual(devs["huey"]["node_id"], "ab" * 32, "the table's node id wins")
+        self.assertTrue(devs["huey"].get("name_conflict"))
+        self.assertTrue(any("signed binding" in n.text for n in notes),
+                        "a disagreement must be visible, not resolved in silence")
+
+    def test_no_ce_iam_is_a_note_not_a_crash(self):
+        old = reach.CE_IAM
+        reach.CE_IAM = "/nonexistent/ce-iam-xyz"
+        try:
+            bound, note = reach.name_bindings()
+        finally:
+            reach.CE_IAM = old
+        self.assertEqual(bound, {})
+        self.assertIn("PATH", note.text)
+
+    def test_garbage_lines_are_ignored_not_guessed_at(self):
+        with FakeCeIam(["(no name bindings held; `ce-iam name bind <name> <node>` to add one)",
+                        "CAPS-NAME -> " + "aa" * 32,
+                        "short -> abc"]):
+            bound, _ = reach.name_bindings()
+        self.assertEqual(bound, {}, "only a lowercase name and a 64-hex node id is a binding")
 
 
 class Ports(unittest.TestCase):

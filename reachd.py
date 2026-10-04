@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
+import proxy  # noqa: E402
 import reach  # noqa: E402
 
 CE_PY = os.environ.get("CE_PY_DIR", os.path.expanduser("~/dev/ce-py"))
@@ -40,7 +41,9 @@ except Exception as _e:  # pragma: no cover - measured by test_gate_absent
 
 KEEPALIVE_S = float(os.environ.get("REACH_KEEPALIVE_S", "30"))
 AUTOUP = os.environ.get("REACH_AUTOUP", "1") == "1"
+PROXY_PORT = int(os.environ.get("REACH_PROXY_PORT", "8944"))
 _last_keepalive = {"ts": None, "opened": [], "failed": []}
+_proxy = {"port": None, "running": False, "detail": "not started"}
 
 
 def build_gate(port):
@@ -163,6 +166,10 @@ class Handler(BaseHTTPRequestHandler):
                                   "actions": ["device-reach:up", "device-reach:down"],
                                   "posture": "fail-closed"},
                 "keepalive": _last_keepalive,
+                "name_proxy": dict(_proxy, stats=(proxy.stats() if _proxy["running"] else None),
+                                   how="http_proxy=http://127.0.0.1:%s curl http://<device>:<port>/path"
+                                       % (_proxy["port"] or PROXY_PORT)),
+                "names": sorted(reach.name_bindings()[0]),
                 "notes": [n.as_dict() for n in notes],
             })
         if path == "/api/devices":
@@ -240,13 +247,26 @@ def serve(port=8943):
     Handler.gate, Handler.gate_error = gate, err or "loaded"
     if gate is None:
         sys.stderr.write("device-reach: NO AUTHORIZATION GATE (%s) -> /api/up refuses\n" % err)
+    if PROXY_PORT:
+        try:
+            proxy.serve_in_thread(PROXY_PORT)
+            _proxy.update({"port": PROXY_PORT, "running": True,
+                           "detail": "resolves <device>:<port> for any proxy-aware client"})
+        except OSError as e:
+            # Not fatal: the forwards and the API are the product, the proxy is the convenience.
+            # But it is REPORTED, because a proxy that silently is not there looks like a name
+            # that does not resolve.
+            _proxy.update({"port": PROXY_PORT, "running": False,
+                           "detail": "could not bind 127.0.0.1:%d: %s" % (PROXY_PORT, e)})
+            sys.stderr.write("device-reach: name proxy NOT running: %s\n" % e)
     stop = threading.Event()
     if AUTOUP:
         threading.Thread(target=keepalive_once, daemon=True).start()
     threading.Thread(target=_keepalive_loop, args=(stop,), daemon=True).start()
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    sys.stderr.write("device-reach %s on http://127.0.0.1:%d/  (gate: %s)\n"
-                     % (reach.VERSION, port, "on" if gate else "REFUSING"))
+    sys.stderr.write("device-reach %s on http://127.0.0.1:%d/  (gate: %s, name proxy: %s)\n"
+                     % (reach.VERSION, port, "on" if gate else "REFUSING",
+                        _proxy["port"] if _proxy["running"] else "off"))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

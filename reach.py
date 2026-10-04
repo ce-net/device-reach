@@ -10,6 +10,7 @@ never probed is UNKNOWN, never "down".
 
 import json
 import os
+import re
 import socket
 import statistics
 import subprocess
@@ -61,20 +62,68 @@ def _read_table(path, notes, source, optional=False):
     return devs
 
 
-def load_devices():
+CE_IAM = os.environ.get("REACH_CE_IAM", "ce-iam")
+NAME_RE = re.compile(r"^(?P<name>[a-z0-9-]{1,63})\s+->\s+(?P<node>[0-9a-f]{64})\b")
+
+
+def name_bindings():
+    """({name: node_id}, note_or_None) from `ce-iam name ls`.
+
+    These are SIGNED name-to-node bindings, resolved through this machine's accepted roots.
+    They are the mesh's own answer to "which node is `huey`", where a device table is only
+    this machine's opinion. Bind one with `ce-iam name bind <name> <node id>`.
+    """
+    try:
+        r = subprocess.run([CE_IAM, "name", "ls"], capture_output=True, text=True, timeout=10)
+    except FileNotFoundError:
+        return {}, Note("ce-iam name", "no `%s` on PATH, so no signed names" % CE_IAM)
+    except subprocess.TimeoutExpired:
+        return {}, Note("ce-iam name", "`%s name ls` did not return in 10 s" % CE_IAM)
+    if r.returncode:
+        return {}, Note("ce-iam name", (r.stderr or r.stdout).strip()[:200])
+    out = {}
+    for line in r.stdout.splitlines():
+        m = NAME_RE.match(line.strip())
+        if m:
+            out[m.group("name")] = m.group("node")
+    return out, None
+
+
+def load_devices(names=True):
     """Every device this machine knows how to reach, merged, plus the notes.
 
-    Later tables win per device, but a field the winner does not state keeps
-    the earlier value rather than becoming null.
+    Three sources, in order: the signed name bindings, the ce-devices table, this machine's
+    own additions. A later source wins per device, but a field it does not state keeps the
+    earlier value rather than becoming null, and a signed binding that DISAGREES with the
+    table keeps the table's node id and leaves a note. A disagreement is a fact to look at,
+    not a tie to break quietly.
     """
     notes = []
     merged = {}
+    if names:
+        bound, note = name_bindings()
+        if note:
+            notes.append(note)
+        for name, node_id in bound.items():
+            merged[name] = {
+                "node_id": node_id, "wallet": name, "_source": "ce-iam name",
+                "name_bound": True,
+                "what": "named on the mesh; no ports declared in any table",
+            }
     for path, source, optional in ((CE_DEV_TABLE, "ce-devices/access.json", False),
                                    (LOCAL_TABLE, "device-reach/devices.json", True)):
         for name, dev in _read_table(path, notes, source, optional).items():
             if name in merged:
                 base = dict(merged[name])
+                bound_id = base.get("node_id") if base.get("name_bound") else None
                 base.update({k: v for k, v in dev.items() if v is not None})
+                if bound_id and dev.get("node_id") and dev["node_id"] != bound_id:
+                    notes.append(Note("ce-iam name", (
+                        "%s: the signed binding says %s… and the table says %s…; using the "
+                        "table. Re-bind or fix the table, do not leave both."
+                    ) % (name, bound_id[:12], dev["node_id"][:12])))
+                    base["name_conflict"] = True
+                base["name_bound"] = bool(bound_id)
                 merged[name] = base
             else:
                 merged[name] = dev
@@ -82,8 +131,16 @@ def load_devices():
 
 
 def declared_ports(dev):
-    """{name: remote_port} for one device. ssh is always declared."""
-    ports = {"ssh": 22}
+    """{name: remote_port} for one device.
+
+    A device from a table gets ssh for free, because every such device was reached by ssh
+    before this app existed. A device known ONLY from a signed name binding declares nothing:
+    the binding says which node the name is, not what that node serves, and guessing an ssh
+    port there would have the keepalive dialling machines nobody asked it to.
+    """
+    ports = {}
+    if dev.get("_source") != "ce-iam name":
+        ports["ssh"] = 22
     for name, port in (dev.get("ports") or {}).items():
         ports[name] = int(port)
     return ports
