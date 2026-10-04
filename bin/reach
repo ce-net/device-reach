@@ -8,6 +8,7 @@
   reach ping <device> [name]    p50/p90 over the forward (default 20 GETs)
   reach get <device> <name> <path>   read-only GET through the forward
   reach down <device> [port]    close those forwards and free the ports (`--all` for every one)
+  reach path [--json]           every mesh peer: RTT, direct or relayed, and which device
   reach doctor                  node, tables, wallet, every forward, with reasons
   reach serve [port]            run the daemon + web page (default 8943)
 
@@ -17,6 +18,7 @@ Exit codes: 0 PASS, 1 FAIL, 2 CANNOT DETERMINE.
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 import reach  # noqa: E402
@@ -225,6 +227,37 @@ def cmd_down(args):
     return FAIL if bad else PASS
 
 
+def cmd_path(args):
+    """What the mesh path to each peer costs, and whether it goes through a relay."""
+    rows, supported, detail = reach.net_paths()
+    if "--json" in args:
+        print(json.dumps({"peers": rows, "path_reported": supported, "detail": detail}, indent=2))
+        return PASS if supported else UNKNOWN
+    if supported is None:
+        print("CANNOT DETERMINE: %s" % detail)
+        return UNKNOWN
+    now = int(time.time())
+    print("%-14s %-46s %9s %8s %7s  %s" % ("device", "peer", "rtt", "samples", "age", "path"))
+    for r in rows:
+        rtt = "%.2f ms" % r["rtt_ms"] if isinstance(r["rtt_ms"], (int, float)) else "no sample"
+        age = r.get("last_seen_secs")
+        age_s = "%ds" % (now - age) if isinstance(age, int) and age else "?"
+        if r["relayed"] is True:
+            path = "RELAYED  %s" % (r["addr"] or "")
+        elif r["relayed"] is False:
+            path = "direct   %s" % (r["addr"] or "")
+        else:
+            path = "unknown"
+        print("%-14s %-46s %9s %8s %7s  %s"
+              % (r["device"] or "-", r["peer"] or "?", rtt, r["samples"], age_s, path))
+    if not supported:
+        print()
+        print("CANNOT DETERMINE which of these went through a relay.")
+        print("  %s" % detail)
+        return UNKNOWN
+    return PASS
+
+
 def cmd_doctor(args):
     bad = unknown = 0
     up, detail = reach.node_up()
@@ -274,7 +307,8 @@ def cmd_serve(args):
 
 
 CMDS = {"ls": cmd_ls, "up": cmd_up, "status": cmd_status, "port": cmd_port,
-        "ping": cmd_ping, "get": cmd_get, "down": cmd_down, "doctor": cmd_doctor,
+        "ping": cmd_ping, "get": cmd_get, "down": cmd_down, "path": cmd_path,
+        "doctor": cmd_doctor,
         "serve": cmd_serve}
 
 

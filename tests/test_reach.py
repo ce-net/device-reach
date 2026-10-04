@@ -40,20 +40,31 @@ TABLE = {
 
 
 class TempTable:
-    """A device table on disk, pointed at by the env the library reads."""
+    """A device table on disk, pointed at by the env the library reads.
+
+    `table` overrides the default fixture. `names=False` also points the ce-iam binary at a
+    path that does not exist, so the test sees only the table and this machine's real signed
+    bindings cannot leak into the result.
+    """
+
+    def __init__(self, table=None, names=True):
+        self.table = TABLE if table is None else table
+        self.names = names
 
     def __enter__(self):
         self.dir = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.dir.name, "access.json")
         with open(self.path, "w") as f:
-            json.dump(TABLE, f)
-        self.old = (reach.CE_DEV_TABLE, reach.LOCAL_TABLE)
+            json.dump(self.table, f)
+        self.old = (reach.CE_DEV_TABLE, reach.LOCAL_TABLE, reach.CE_IAM)
         reach.CE_DEV_TABLE = self.path
         reach.LOCAL_TABLE = os.path.join(self.dir.name, "absent.json")
+        if not self.names:
+            reach.CE_IAM = os.path.join(self.dir.name, "no-ce-iam-here")
         return self
 
     def __exit__(self, *a):
-        reach.CE_DEV_TABLE, reach.LOCAL_TABLE = self.old
+        reach.CE_DEV_TABLE, reach.LOCAL_TABLE, reach.CE_IAM = self.old
         self.dir.cleanup()
 
 
@@ -206,9 +217,10 @@ class FakeNode:
     node built before the close route. Otherwise it is the list of open forwards.
     """
 
-    def __init__(self, tunnels=None, token="tok"):
+    def __init__(self, tunnels=None, token="tok", netgraph=None):
         self.tunnels = tunnels
         self.token = token
+        self.netgraph = netgraph
         self.deleted = []
         outer = self
 
@@ -225,6 +237,10 @@ class FakeNode:
                 self.wfile.write(b)
 
             def do_GET(self):
+                if self.path == "/netgraph":
+                    if outer.netgraph is None:
+                        return self._send(404, {"error": "no such route"})
+                    return self._send(200, outer.netgraph)
                 if self.path == "/tunnels":
                     if outer.tunnels is None:
                         return self._send(404, {"error": "no such route"})
@@ -423,6 +439,63 @@ class GateRefuses(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
             reachd.Handler.gate, reachd.Handler.gate_error = old_gate, old_err
+
+
+class Paths(unittest.TestCase):
+    """A measurement without its path is half an answer, and the half it is missing is the
+    one that explains the number."""
+
+    # This machine's own node, printed by `ce status`: the node id and the peer id it derives
+    # to. If the derivation ever drifts, this pair catches it without a network.
+    NODE = "0e95015b2d034b3c973e1fe22e2e811067c409daa24e01ac8d9eadb1543ed493"
+    PEER = "12D3KooWAoHf6V77YJQ6bo21BVT5YwSwigkcR8hG2DUjfq6DqVht"
+
+    def test_a_node_id_derives_its_peer_id_with_no_lookup(self):
+        self.assertEqual(reach.peer_id_for(self.NODE), self.PEER)
+
+    def test_something_that_is_not_a_node_id_derives_nothing(self):
+        for bad in ("", "beef", "zz" * 32, None, "ab" * 31):
+            self.assertIsNone(reach.peer_id_for(bad), "%r is not a node id" % (bad,))
+
+    def test_an_old_node_is_reported_as_unable_to_say_not_as_no_relays(self):
+        """The failure mode this guards: reading a missing field as False and publishing
+        'every path is direct' off a node that was never asked."""
+        old = [{"peer": self.PEER, "rtt_ms": 128.0, "samples": 9, "last_seen_secs": 1}]
+        with FakeNode(netgraph=old):
+            rows, supported, detail = reach.net_paths()
+        self.assertIs(supported, False)
+        self.assertIn("netgraph-path", detail)
+        self.assertIsNone(rows[0]["relayed"], "unknown, never False")
+
+    def test_a_new_node_reports_the_path_and_names_the_device(self):
+        tbl = {"devices": {"mine": {"what": "this machine", "wallet": "w",
+                                    "node_id": self.NODE, "ports": {"api": 1}}}}
+        rows = [{"peer": self.PEER, "rtt_ms": 0.9, "samples": 120, "last_seen_secs": 1,
+                 "addr": "/ip4/192.168.1.9/tcp/4001", "relayed": False},
+                {"peer": "12D3KooWHkCw1zQX67N444WUVQokFy5hPVougDGKRJsMxoyoBYMS",
+                 "rtt_ms": 79.3, "samples": 6157, "last_seen_secs": 1,
+                 "addr": "/ip4/1.2.3.4/tcp/4001/p2p/QmR/p2p-circuit/p2p/QmT", "relayed": True}]
+        with TempTable(tbl, names=False), FakeNode(netgraph=rows):
+            out, supported, detail = reach.net_paths()
+        self.assertIs(supported, True)
+        self.assertEqual(detail, "")
+        self.assertEqual(out[0]["device"], "mine", "a peer id maps back to the device name")
+        self.assertIs(out[0]["relayed"], False)
+        self.assertIs(out[1]["relayed"], True)
+        self.assertIsNone(out[1]["device"], "an unknown peer is not guessed at")
+
+    def test_a_node_with_no_peers_is_cannot_determine_not_a_clean_pass(self):
+        with FakeNode(netgraph=[]):
+            rows, supported, detail = reach.net_paths()
+        self.assertEqual(rows, [])
+        self.assertIsNone(supported)
+        self.assertIn("no connected peers", detail)
+
+    def test_a_node_that_does_not_answer_is_cannot_determine(self):
+        with FakeNode(netgraph=None):   # /netgraph 404s
+            rows, supported, detail = reach.net_paths()
+        self.assertIsNone(supported)
+        self.assertTrue(detail)
 
 
 @unittest.skipUnless(LIVE, "set REACH_LIVE=1 to reach the real devices")

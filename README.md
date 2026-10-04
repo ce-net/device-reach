@@ -50,6 +50,7 @@ here.
 | `reach ping <device> [port] [--path /p] [-n 30]` | p50/p90 over the forward, or CANNOT DETERMINE |
 | `reach get <device> <port> <path>` | a read-only GET through the forward |
 | `reach down <device> [port]` / `--all` | close those forwards and free the ports; on a node without the close route it says so |
+| `reach path [--json]` | every mesh peer: measured RTT, how many samples, and whether the path is direct or relayed |
 | `reach doctor` | node, tables, wallet, every forward, with reasons |
 | `reach serve [port]` | the daemon and its machines page (default 8943) |
 
@@ -105,6 +106,28 @@ ssh -o ProxyCommand='nc -X connect -x 127.0.0.1:8944 %h %p' arduino@huey
 It speaks absolute-URI requests and `CONNECT`, so TLS and ssh go through it too, and it opens
 the forward on demand. An unknown name is a 502 that lists the devices it does know.
 `REACH_PROXY_PORT=0` turns it off.
+
+## Direct or relayed — `reach path`
+
+A latency number says what a path cost, never which path it was. 0.7 ms and 128 ms on the same
+mesh can both be real, and a relayed hop produces exactly the same field as a direct one. So
+`reach path` prints the peer, the RTT ce itself measured, how many samples are behind it, how
+long ago the last one was, and the address the connection came up on:
+
+```
+device         peer                                     rtt  samples     age  path
+-              12D3KooWSXionnye…ZefQWhrwH            0.72 ms    12982      9s  direct   /ip4/…/tcp/4001
+huey           12D3KooWHkCw1zQX…xoyoBYMS            79.32 ms     6157   2131s  RELAYED  /ip4/…/p2p-circuit/p2p/…
+```
+
+A peer is named when its peer id derives from a node id this machine knows. That derivation is
+local arithmetic, not a lookup: a libp2p peer id for an Ed25519 key is the identity multihash of
+the protobuf-encoded public key in base58btc, and a ce node id **is** that public key in hex.
+
+On a node that does not report `addr` and `relayed` the path column reads `unknown` and the
+command exits **2 CANNOT DETERMINE**, naming the branch that adds the fields. It does not read a
+missing field as "direct" — that would publish "no relays on this mesh" off a node that was
+never asked.
 
 ## Devices
 

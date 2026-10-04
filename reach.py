@@ -292,6 +292,85 @@ def close_forward(local_port):
     return False, detail or "DELETE /tunnel answered %s: %s" % (status, doc)
 
 
+# ----- the mesh path: who is connected, over what, and at what cost -----
+
+# A libp2p PeerId for an Ed25519 key is the identity multihash of the protobuf-encoded public
+# key, base58btc. A ce node id IS that public key in hex, so the two are the same fact written
+# twice and the mapping needs no lookup and no network. Checked against this node's own
+# /status, which prints both.
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58(raw):
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = _B58[r] + out
+    for c in raw:
+        if c != 0:
+            break
+        out = "1" + out
+    return out
+
+
+def peer_id_for(node_id):
+    """The libp2p peer id of a ce node id (64 hex), or None if that is not a node id."""
+    try:
+        key = bytes.fromhex(node_id)
+    except (ValueError, TypeError):
+        return None
+    if len(key) != 32:
+        return None
+    pb = b"\x08\x01\x12\x20" + key          # protobuf PublicKey{Type: Ed25519, Data: key}
+    return _b58(b"\x00" + bytes([len(pb)]) + pb)  # identity multihash, base58btc
+
+
+# An older node answers /netgraph without `addr` and `relayed`, so it can say a peer is 128 ms
+# away but not whether those milliseconds went through a relay. That is a node too old to
+# answer the question, not a mesh with no relays on it.
+PATH_UNSUPPORTED = (
+    "this ce node does not report the path behind a measurement: its /netgraph rows carry no "
+    "`addr` or `relayed` field, so a relayed hop and a direct one are indistinguishable here. "
+    "The fields are ce/crates/ce-node/src/api.rs (GET /netgraph) on branch netgraph-path."
+)
+
+
+def net_paths():
+    """(rows, supported, detail). Every connected peer: its RTT, its address, direct or relayed.
+
+    `supported` is False when the node is too old to say, None when nothing could be read, and
+    True when the rows carry the path. A row's `device` is filled in when the peer id derives
+    from a node id this machine knows by name.
+    """
+    status_code, doc, detail = _node_json("/netgraph")
+    if status_code != 200 or not isinstance(doc, list):
+        return [], None, detail or "GET /netgraph answered %s" % status_code
+    devs, _ = load_devices()
+    by_peer = {}
+    for name, dev in devs.items():
+        pid = peer_id_for(dev.get("node_id") or "")
+        if pid:
+            by_peer[pid] = name
+    rows = []
+    for r in doc:
+        if not isinstance(r, dict):
+            continue
+        rows.append({
+            "peer": r.get("peer"),
+            "device": by_peer.get(r.get("peer")),
+            "rtt_ms": r.get("rtt_ms"),
+            "samples": r.get("samples"),
+            "last_seen_secs": r.get("last_seen_secs"),
+            "addr": r.get("addr"),
+            "relayed": r.get("relayed"),
+        })
+    if not doc:
+        return rows, None, "this node has no connected peers, so there is no path to measure"
+    supported = all("relayed" in r for r in doc if isinstance(r, dict))
+    return rows, supported, "" if supported else PATH_UNSUPPORTED
+
+
 def http_probe(url, timeout=5.0):
     """(status, seconds, detail). status is an int, or None when it did not answer."""
     t = time.perf_counter()
